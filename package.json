@@ -1,6 +1,7 @@
 {
   "name": "stratum-solo-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "A pure solo Bitcoin Stratum gateway with ASICBoost, extranonce subscription, and bcoin witness commitment support.",
   "type": "module",
   "scripts": {
     "dev": "ts-node-esm src/index.ts",
