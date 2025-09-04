@@ -6,14 +6,30 @@
   "scripts": {
     "dev": "ts-node-esm src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist",
+    "prestart": "npm run build"
   },
   "dependencies": {
     "bcoin": "git+https://github.com/bcoin-org/bcoin.git#master",
-    "bech32": "^2.0.0"
+    "bech32": "^2.2.0"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.4"
+  },
+  "keywords": [
+    "bitcoin",
+    "mining",
+    "stratum",
+    "solo",
+    "asicboost",
+    "bcoin"
+  ],
+  "author": "Gamesci",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
