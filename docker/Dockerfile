@@ -10,9 +10,8 @@ WORKDIR /app
 # 复制 package.json
 COPY package.json ./
 
-# 生成 package-lock.json 并安装依赖
-RUN npm install --package-lock-only && \
-    npm ci --omit=dev
+# 安装所有依赖（包括开发依赖）
+RUN npm install
 
 # 复制源代码
 COPY . .
@@ -26,9 +25,13 @@ FROM node:20-alpine
 # 设置工作目录
 WORKDIR /app
 
-# 从构建阶段复制必要的文件
-COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/node_modules ./node_modules
+# 复制 package.json
+COPY package.json ./
+
+# 只安装生产依赖
+RUN npm ci --omit=dev
+
+# 从构建阶段复制构建结果
 COPY --from=builder /app/dist ./dist
 
 # 创建非root用户运行应用
