@@ -1,0 +1,13 @@
+version: '3.8'
+
+  solo-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stratum-solo-gateway
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    ports:
+      - "3333:3333"
+
