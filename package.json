@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "bcoin": "git+https://github.com/bcoin-org/bcoin.git#master",
-    "bech32": "^2.2.0"
+    "bech32": "^2.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
