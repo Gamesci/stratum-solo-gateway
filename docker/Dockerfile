@@ -1,44 +1,46 @@
-# ===== 依赖构建阶段 =====
-FROM node:20-alpine AS deps
-WORKDIR /app
+# 使用多阶段构建以减少最终镜像大小
+FROM node:20-alpine AS builder
 
-# 安装构建依赖（支持从 Git 拉包）
+# 安装构建依赖
 RUN apk add --no-cache git python3 make g++
 
-# 复制依赖清单
-COPY package.json package-lock.json* ./
-
-# 如果有 lock 文件就用 npm ci，否则用 npm install
-RUN if [ -f package-lock.json ]; then \
-      npm ci --omit=dev; \
-    else \
-      npm install --omit=dev; \
-    fi
-
-# ===== 构建阶段 =====
-FROM node:20-alpine AS build
+# 设置工作目录
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+
+# 复制 package.json
+COPY package.json ./
+
+# 生成 package-lock.json 并安装依赖
+RUN npm install --package-lock-only && \
+    npm ci --omit=dev
+
+# 复制源代码
 COPY . .
+
+# 构建项目
 RUN npm run build
 
-# ===== 运行阶段 =====
-FROM node:20-alpine AS runtime
+# 最终阶段
+FROM node:20-alpine
+
+# 设置工作目录
 WORKDIR /app
 
-# 使用 tini 作为 init 进程（可选，提升信号处理）
-RUN apk add --no-cache tini
+# 从构建阶段复制必要的文件
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
 
-# 复制运行所需文件
-COPY --from=build /app/dist ./dist
-COPY package.json ./
-COPY --from=deps /app/node_modules ./node_modules
-
-# 创建非 root 用户运行
+# 创建非root用户运行应用
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S bitcoin -u 1001 && \
     chown -R bitcoin:nodejs /app
 
+# 切换到非root用户
+USER bitcoin
+
+# 暴露Stratum端口
 EXPOSE 3333
-ENTRYPOINT ["/sbin/tini", "--"]
+
+# 启动应用
 CMD ["node", "dist/index.js"]
