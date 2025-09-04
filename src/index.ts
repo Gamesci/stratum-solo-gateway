@@ -2,6 +2,7 @@ import net from 'net';
 import http from 'http';
 import https from 'https';
 import crypto from 'crypto';
+import zmq from 'zeromq';
 import {
   addressToScriptPubKey, dsha256, toLE, u64, varint,
   merkleBranchesForCoinbaseAt0
@@ -25,6 +26,7 @@ const REFRESH_MS = parseInt(process.env.REFRESH_MS || '10000', 10);
 const VERSION_MASK_HEX = (process.env.VERSION_MASK || '0x1fffe000').toString().toLowerCase();
 const VERSION_MASK = BigInt(VERSION_MASK_HEX);
 const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384');
+const ZMQ_BLOCK = process.env.ZMQ_BLOCK || 'tcp://bitcoin:28332';
 if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
 
 /* ===== Local RPC helper + retry ===== */
@@ -282,7 +284,7 @@ function buildFullBlock_bcoin(job: Job, coinbaseTx: TXType, versionBE: number, n
   block.version = versionBE >>> 0;
   block.prevBlock = Buffer.from(job.gbt.previousblockhash, 'hex').reverse();
   block.time = ntime >>> 0;
-  block.bits = parseInt(job.nbits, 16) >>> 0;
+  block.bits = parseInt(job.nbits, '16') >>> 0;
   block.nonce = nonceBE >>> 0;
 
   block.txs.push(coinbaseTx);
@@ -306,14 +308,13 @@ function validateRolledVersion(baseVersion: number, submittedVersion: number, ma
 const clients = new Map<net.Socket, ClientState>();
 
 function json(socket: net.Socket, id: any, result: any, error: any = null) {
-  const response = JSON.stringify({ id, result, error }) + '\n';
-  socket.write(response);
+  socket.write(JSON.stringify({ id, result, error }) + '\n');
 }
 
 function sendNotify(socket: net.Socket, job: Job) {
   const params = [
     job.jobId,
-    job.prevhashLE,      // little-endian for Stratum
+    job.prevhashLE,
     job.coinb1,
     job.coinb2,
     job.merkleBranchesLE,
@@ -343,10 +344,32 @@ async function submitBlock(hexBlock: string) {
   return rpc('submitblock', [hexBlock], 3);
 }
 
-/* ===== Main ===== */
-async function main() {
-  let currentJob: Job;
+/* ===== ZMQ 新块推送 ===== */
+async function subscribeZmqNewBlock() {
+  const sock = new zmq.Subscriber();
+  sock.connect(ZMQ_BLOCK);
+  sock.subscribe('hashblock');
+  console.log(`ZMQ: Subscribed to new block notifications at ${ZMQ_BLOCK}`);
 
+  for await (const [topic, message] of sock) {
+    if (topic.toString() === 'hashblock') {
+      const blockHash = message.toString('hex');
+      console.log(`ZMQ: New block detected ${blockHash}, refreshing job...`);
+      try {
+        const gbt = await getTemplate();
+        currentJob = buildJob(gbt);
+        for (const [sock] of clients) sendNotify(sock, currentJob);
+      } catch (e) {
+        console.error('ZMQ: Failed to refresh job after new block:', e);
+      }
+    }
+  }
+}
+
+/* ===== Main ===== */
+let currentJob: Job;
+
+async function main() {
   try {
     currentJob = buildJob(await getTemplate());
     console.log(`Initial job created for height ${currentJob.gbt.height}`);
@@ -355,12 +378,15 @@ async function main() {
     process.exit(1);
   }
 
+  // 定时刷新（兜底）
   setInterval(async () => {
     try {
       const gbt = await getTemplate();
-      if (gbt.previousblockhash !== currentJob.gbt.previousblockhash ||
-          gbt.curtime !== currentJob.gbt.curtime ||
-          gbt.transactions.length !== currentJob.gbt.transactions.length) {
+      if (
+        gbt.previousblockhash !== currentJob.gbt.previousblockhash ||
+        gbt.curtime !== currentJob.gbt.curtime ||
+        gbt.transactions.length !== currentJob.gbt.transactions.length
+      ) {
         currentJob = buildJob(gbt);
         console.log(`New job created for height ${currentJob.gbt.height}`);
         for (const [sock] of clients) sendNotify(sock, currentJob);
@@ -370,171 +396,10 @@ async function main() {
     }
   }, REFRESH_MS);
 
-  const server = net.createServer(socket => {
-    const remoteAddress = `${socket.remoteAddress}:${socket.remotePort}`;
-    console.log(`New connection from ${remoteAddress}`);
+  // 启动 ZMQ 推送监听
+  subscribeZmqNewBlock().catch(e => console.error('ZMQ subscription error:', e));
 
-    const state: ClientState = {
-      id: Math.floor(Math.random() * 1e9),
-      extranonce1: cryptoRandom(4),
-      authorized: false,
-      extranonceSubscribed: false,
-      negotiatedVersionRolling: false,
-      versionMaskHex: VERSION_MASK_HEX.startsWith('0x') ? VERSION_MASK_HEX.slice(2) : VERSION_MASK_HEX,
-      jobs: new Map<string, Job>([[currentJob.jobId, currentJob]])
-    };
-    clients.set(socket, state);
-
-    socket.on('data', async (buf: Buffer) => {
-      const lines = buf.toString().split('\n').map(s => s.trim()).filter(Boolean);
-      for (const line of lines) {
-        let msg: any;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          console.error('Invalid JSON from client:', line);
-          continue;
-        }
-
-        const { id, method, params } = msg;
-
-        if (method === 'mining.configure') {
-          state.negotiatedVersionRolling = true;
-          json(socket, id, { 'version-rolling': true, 'version-rolling.mask': state.versionMaskHex });
-          sendVersionMask(socket, state.versionMaskHex);
-          continue;
-        }
-
-        if (method === 'mining.extranonce.subscribe') {
-          state.extranonceSubscribed = true;
-          json(socket, id, true);
-          sendSetExtranonce(socket, state);
-          continue;
-        }
-
-        if (method === 'mining.subscribe') {
-          const extranonce1Hex = state.extranonce1.toString('hex');
-          json(socket, id, [[['mining.set_difficulty', state.id], ['mining.notify', state.id]], extranonce1Hex, EXTRANONCE2_SIZE]);
-          sendNotify(socket, currentJob);
-          if (state.negotiatedVersionRolling) sendVersionMask(socket, state.versionMaskHex);
-          if (state.extranonceSubscribed) sendSetExtranonce(socket, state);
-          continue;
-        }
-
-        if (method === 'mining.authorize') {
-          state.authorized = true;
-          console.log(`Client ${remoteAddress} authorized as ${params[0]}`);
-          json(socket, id, true);
-          continue;
-        }
-
-        if (method === 'mining.submit') {
-          if (!state.authorized) {
-            json(socket, id, false, { code: 24, message: 'Unauthorized worker' });
-            continue;
-          }
-
-          const worker = params[0];
-          const jobId: string = params[1];
-          const en2: string = params[2];
-          const ntimeHex = (params[3] as string).padStart(8, '0');
-          const nonceHex = (params[4] as string).padStart(8, '0');
-          const submittedVersionHex: string | undefined = params[5];
-
-          const job = state.jobs.get(jobId) || currentJob;
-
-          if (en2.length !== EXTRANONCE2_SIZE * 2) {
-            json(socket, id, false, { code: 20, message: 'Invalid extranonce2 size' });
-            continue;
-          }
-
-          const extranonce1Hex = state.extranonce1.toString('hex');
-          const coinbaseHex = job.coinb1 + extranonce1Hex + en2 + job.coinb2;
-          const coinbaseBuf = Buffer.from(coinbaseHex, 'hex');
-
-          // Build merkle root: coinbase at left, then each sibling branch (LE)
-          let root = dsha256(coinbaseBuf);
-          for (const branchHexLE of job.merkleBranchesLE) {
-            const branch = Buffer.from(branchHexLE, 'hex');
-            root = dsha256(Buffer.concat([root, branch]));
-          }
-
-          // Version rolling
-          let versionHex = job.versionHex;
-          let versionBE = job.versionBE;
-          if (submittedVersionHex && state.negotiatedVersionRolling) {
-            const subV = parseInt(submittedVersionHex, 16) >>> 0;
-            if (!validateRolledVersion(job.versionBE, subV, VERSION_MASK)) {
-              json(socket, id, false, { code: 22, message: 'Invalid version rolling beyond mask' });
-              continue;
-            }
-            versionHex = subV.toString(16).padStart(8, '0');
-            versionBE = subV >>> 0;
-          }
-
-          // Check target
-          const header = packHeader(versionHex, job.prevhashBE, root, ntimeHex, job.nbits, nonceHex);
-          const headerHashBE = dsha256(header);
-          const targetBE = Buffer.from(job.targetHex, 'hex');
-          const meets = cmp256(headerHashBE, targetBE);
-
-          if (meets) {
-            console.log(`Potential block found by ${worker} | height=${job.gbt.height}`);
-            try {
-              const extraNonce = Buffer.from(extranonce1Hex + en2, 'hex');
-              const coinbaseTX = buildCoinbaseTX_bcoin(job.gbt, extraNonce, PAYOUT_ADDRESS);
-              const ntimeBE = parseInt(ntimeHex, 16) >>> 0;
-              const nonceBE = parseInt(nonceHex, 16) >>> 0;
-              const block = buildFullBlock_bcoin(job, coinbaseTX, versionBE, ntimeBE, nonceBE);
-              const raw = block.toRaw();
-              await submitBlock(raw.toString('hex'));
-              console.log(`BLOCK SUBMITTED by ${worker} | height=${job.gbt.height} | version=${versionHex}`);
-            } catch (e) {
-              console.error('Block construction/submission error:', e);
-            }
-          } else {
-            console.log(`Share accepted from ${worker} | height=${job.gbt.height}`);
-          }
-
-          json(socket, id, true);
-          continue;
-        }
-
-        json(socket, id, null, { code: -3, message: 'Unknown method' });
-      }
-    });
-
-    socket.on('close', () => {
-      console.log(`Client ${remoteAddress} disconnected`);
-      clients.delete(socket);
-    });
-
-    socket.on('error', (err) => {
-      console.error(`Socket error for ${remoteAddress}:`, err);
-      clients.delete(socket);
-    });
-  });
-
-  server.listen(parseInt(PORT, 10), HOST, () => {
-    console.log(`Stratum solo server listening on ${HOST}:${PORT}`);
-    console.log(`Payout address: ${PAYOUT_ADDRESS}`);
-    console.log(`ASICBoost mask: ${VERSION_MASK_HEX}`);
-    console.log(`Share difficulty: ${SHARE_DIFFICULTY}`);
-  });
-
-  server.on('error', (err) => {
-    console.error('Server error:', err);
-    process.exit(1);
-  });
 }
-
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled rejection at:', promise, 'reason:', reason);
-});
 
 main().catch(e => {
   console.error('Fatal error:', e);
