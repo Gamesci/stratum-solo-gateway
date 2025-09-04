@@ -51,15 +51,12 @@ export function merkleRoot(txidsLE: Buffer[]) {
 export type ScriptPubKey = Buffer;
 
 export function addressToScriptPubKey(addr: string): ScriptPubKey {
-  // Supports: P2PKH (legacy), P2SH, Bech32 P2WPKH/P2WSH
   if (addr.startsWith('bc1') || addr.startsWith('tb1') || addr.startsWith('bcrt1')) {
     const dec = bech32.decode(addr);
     const data = bech32.fromWords(dec.words.slice(1));
     if (data.length === 20) {
-      // P2WPKH: 0 <20>
       return Buffer.concat([Buffer.from([0x00, 0x14]), Buffer.from(data)]);
     } else if (data.length === 32) {
-      // P2WSH: 0 <32>
       return Buffer.concat([Buffer.from([0x00, 0x20]), Buffer.from(data)]);
     }
     throw new Error('Unsupported Bech32 program length');
@@ -67,9 +64,9 @@ export function addressToScriptPubKey(addr: string): ScriptPubKey {
   const payload = base58checkDecode(addr);
   const ver = payload[0];
   const h = payload.slice(1);
-  if (ver === 0x00) { // P2PKH
+  if (ver === 0x00) {
     return Buffer.concat([Buffer.from([0x76, 0xa9, 0x14]), h, Buffer.from([0x88, 0xac])]);
-  } else if (ver === 0x05) { // P2SH
+  } else if (ver === 0x05) {
     return Buffer.concat([Buffer.from([0xa9, 0x14]), h, Buffer.from([0x87])]);
   }
   throw new Error('Unsupported base58 address');
