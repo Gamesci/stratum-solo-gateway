@@ -9,7 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "bcoin": "^2.2.0",
+    "bcoin": "git+https://github.com/bcoin-org/bcoin.git#master",
     "bech32": "^2.0.0"
   },
   "devDependencies": {
