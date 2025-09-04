@@ -305,23 +305,23 @@ async function subscribeZmqNewBlock() {
   sock.subscribe('hashblock');
   console.log(`ZMQ: Subscribed to new block notifications at ${ZMQ_BLOCK}`);
 
-(sock as any).on('error', (err: any) => {
-  console.error('ZMQ error:', err);
-  console.log('Reconnecting to ZMQ in 5s...');
-  setTimeout(() => subscribeZmqNewBlock().catch(console.error), 5000);
-});
-
-  for await (const [topic, message] of sock) {
-    if (topic.toString() === 'hashblock') {
-      console.log(`ZMQ: New block ${message.toString('hex')}, refreshing job...`);
-      try {
-        const gbt = await getTemplate();
-        currentJob = buildJob(gbt);
-        for (const [sock] of clients) sendNotify(sock, currentJob);
-      } catch (e) {
-        console.error('ZMQ refresh error:', e);
+  try {
+    for await (const [topic, message] of sock) {
+      if (topic.toString() === 'hashblock') {
+        console.log(`ZMQ: New block ${message.toString('hex')}, refreshing job...`);
+        try {
+          const gbt = await getTemplate();
+          currentJob = buildJob(gbt);
+          for (const [clientSock] of clients) sendNotify(clientSock, currentJob);
+        } catch (e) {
+          console.error('ZMQ refresh error:', e);
+        }
       }
     }
+  } catch (err) {
+    console.error('ZMQ subscription error:', err);
+    console.log('Reconnecting to ZMQ in 5s...');
+    setTimeout(() => subscribeZmqNewBlock().catch(console.error), 5000);
   }
 }
 
