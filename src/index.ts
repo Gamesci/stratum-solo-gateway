@@ -3,7 +3,7 @@ import http from 'http';
 import https from 'https';
 import crypto from 'crypto';
 import {
-  addressToScriptPubKey, dsha256, fromLE, toLE, u64, varint,
+  addressToScriptPubKey, dsha256, toLE, u64, varint,
   merkleBranchesForCoinbaseAt0
 } from './utils.js';
 
@@ -27,22 +27,22 @@ const VERSION_MASK = BigInt(VERSION_MASK_HEX);
 const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384');
 if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
 
-/* ===== Local RPC helper ===== */
-function rpc<T=any>(method: string, params: any[] = []): Promise<T> {
+/* ===== Local RPC helper + retry ===== */
+function rawRpc<T=any>(method: string, params: any[] = []): Promise<T> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
     const url = new URL(RPC_URL);
     const isHttps = url.protocol === 'https:';
     const client = isHttps ? https : http;
-    
+
     const req = client.request({
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: url.pathname || '/',
       method: 'POST',
       auth: `${RPC_USER}:${RPC_PASS}`,
-      headers: { 
-        'Content-Type': 'application/json', 
+      headers: {
+        'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
         'Connection': 'close'
       },
@@ -55,22 +55,36 @@ function rpc<T=any>(method: string, params: any[] = []): Promise<T> {
           const parsed = JSON.parse(data);
           if (parsed.error) reject(parsed.error);
           else resolve(parsed.result);
-        } catch (e) { 
+        } catch (e) {
           console.error('RPC response parse error:', e, 'Data:', data);
-          reject(e); 
+          reject(e);
         }
       });
     });
-    
+
     req.on('error', reject);
     req.on('timeout', () => {
       req.destroy();
       reject(new Error('RPC request timeout'));
     });
-    
+
     req.write(body);
     req.end();
   });
+}
+
+async function rpc<T=any>(method: string, params: any[] = [], retries = 3): Promise<T> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await rawRpc<T>(method, params);
+    } catch (e) {
+      if (attempt === retries) throw e;
+      const backoffMs = 500 * attempt;
+      console.warn(`RPC ${method} failed (attempt ${attempt}), retrying in ${backoffMs}ms...`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+  throw new Error('unreachable');
 }
 
 /* ===== Types ===== */
@@ -139,25 +153,15 @@ function encodeScriptNumber(n: number): Buffer {
 
 function cryptoRandom(n: number) { return crypto.randomBytes(n); }
 
+// 标准 compact bits → target（与 Bitcoin Core 一致）
 function bitsToTargetHex(bitsHex: string) {
   const bits = Buffer.from(bitsHex, 'hex');
-  const exp = bits[0];
-  const mant = ((bits[1] << 16) | (bits[2] << 8) | bits[3]) >>> 0;
-  
-  if (exp <= 3) {
-    return (mant >> (8 * (3 - exp))).toString(16).padStart(64, '0');
-  }
-  
-  const target = Buffer.alloc(32, 0);
-  const shift = exp - 3;
-  const start = 32 - shift;
-  
-  if (start < 0) return '0000000000000000000000000000000000000000000000000000000000000000';
-  
-  const mantBuf = Buffer.alloc(4);
-  mantBuf.writeUInt32BE(mant, 0);
-  target.set(mantBuf.slice(0, shift), start);
-  return target.toString('hex');
+  const exp = bits.readUInt8(0);
+  const mant = bits.readUIntBE(1, 3);
+  const shift = 8n * (BigInt(exp) - 3n);
+  let target = BigInt(mant);
+  if (shift > 0) target = target << shift;
+  return target.toString(16).padStart(64, '0');
 }
 
 function packHeader(versionHex: string, prevhashBE: string, merkleRoot: Buffer, ntimeHex8: string, nbitsHex: string, nonceHex8: string) {
@@ -180,12 +184,7 @@ function cmp256(a: Buffer, b: Buffer) {
 }
 
 async function getTemplate(): Promise<Gbt> {
-  try {
-    return await rpc<Gbt>('getblocktemplate', [{ rules: ['segwit'] }]);
-  } catch (e) {
-    console.error('Failed to get block template:', e);
-    throw e;
-  }
+  return rpc<Gbt>('getblocktemplate', [{ rules: ['segwit'] }], 3);
 }
 
 /* ===== Job builder ===== */
@@ -197,7 +196,10 @@ function buildJob(gbt: Gbt): Job {
   const coinb1 = cbMarked.slice(0, idx).toString('hex');
   const coinb2 = cbMarked.slice(idx + mark.length).toString('hex');
 
-  const nonCbTxidsBE = gbt.transactions.map(t => t.txid || t.hash);
+  const nonCbTxidsBE = gbt.transactions
+    .map(t => t.txid || t.hash)
+    .filter((x): x is string => !!x);
+
   const merkleBranchesLE = merkleBranchesForCoinbaseAt0(nonCbTxidsBE);
 
   const prevhashBE = gbt.previousblockhash;
@@ -264,6 +266,7 @@ function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string)
   const addr = Address.fromString(payoutAddr);
   mtx.addOutput({ address: addr, value: gbt.coinbasevalue });
 
+  // witness reserved value (32 bytes zeros)
   mtx.inputs[0].witness.push(Buffer.alloc(32, 0));
 
   if (gbt.default_witness_commitment) {
@@ -286,14 +289,8 @@ function buildFullBlock_bcoin(job: Job, coinbaseTx: TXType, versionBE: number, n
   for (const tx of job.gbt.transactions) {
     block.txs.push(TX.fromRaw(Buffer.from(tx.data, 'hex')));
   }
-  
-  try {
-    block.refresh();
-  } catch (e) {
-    console.error('Block refresh error:', e);
-    throw e;
-  }
-  
+
+  block.refresh(); // compute merkle/witness roots
   return block as BlockType;
 }
 
@@ -316,7 +313,7 @@ function json(socket: net.Socket, id: any, result: any, error: any = null) {
 function sendNotify(socket: net.Socket, job: Job) {
   const params = [
     job.jobId,
-    job.prevhashLE,
+    job.prevhashLE,      // little-endian for Stratum
     job.coinb1,
     job.coinb2,
     job.merkleBranchesLE,
@@ -343,20 +340,13 @@ function sendSetExtranonce(socket: net.Socket, state: ClientState) {
 
 /* ===== Submit ===== */
 async function submitBlock(hexBlock: string) {
-  try {
-    const result = await rpc('submitblock', [hexBlock]);
-    console.log('Block submission result:', result);
-    return result;
-  } catch (e) {
-    console.error('Block submission error:', e);
-    throw e;
-  }
+  return rpc('submitblock', [hexBlock], 3);
 }
 
 /* ===== Main ===== */
 async function main() {
   let currentJob: Job;
-  
+
   try {
     currentJob = buildJob(await getTemplate());
     console.log(`Initial job created for height ${currentJob.gbt.height}`);
@@ -368,7 +358,7 @@ async function main() {
   setInterval(async () => {
     try {
       const gbt = await getTemplate();
-      if (gbt.previousblockhash !== currentJob.gbt.previousblockhash || 
+      if (gbt.previousblockhash !== currentJob.gbt.previousblockhash ||
           gbt.curtime !== currentJob.gbt.curtime ||
           gbt.transactions.length !== currentJob.gbt.transactions.length) {
         currentJob = buildJob(gbt);
@@ -383,7 +373,7 @@ async function main() {
   const server = net.createServer(socket => {
     const remoteAddress = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`New connection from ${remoteAddress}`);
-    
+
     const state: ClientState = {
       id: Math.floor(Math.random() * 1e9),
       extranonce1: cryptoRandom(4),
@@ -399,13 +389,13 @@ async function main() {
       const lines = buf.toString().split('\n').map(s => s.trim()).filter(Boolean);
       for (const line of lines) {
         let msg: any;
-        try { 
-          msg = JSON.parse(line); 
-        } catch (e) { 
+        try {
+          msg = JSON.parse(line);
+        } catch {
           console.error('Invalid JSON from client:', line);
-          continue; 
+          continue;
         }
-        
+
         const { id, method, params } = msg;
 
         if (method === 'mining.configure') {
@@ -462,12 +452,14 @@ async function main() {
           const coinbaseHex = job.coinb1 + extranonce1Hex + en2 + job.coinb2;
           const coinbaseBuf = Buffer.from(coinbaseHex, 'hex');
 
+          // Build merkle root: coinbase at left, then each sibling branch (LE)
           let root = dsha256(coinbaseBuf);
           for (const branchHexLE of job.merkleBranchesLE) {
             const branch = Buffer.from(branchHexLE, 'hex');
             root = dsha256(Buffer.concat([root, branch]));
           }
 
+          // Version rolling
           let versionHex = job.versionHex;
           let versionBE = job.versionBE;
           if (submittedVersionHex && state.negotiatedVersionRolling) {
@@ -480,6 +472,7 @@ async function main() {
             versionBE = subV >>> 0;
           }
 
+          // Check target
           const header = packHeader(versionHex, job.prevhashBE, root, ntimeHex, job.nbits, nonceHex);
           const headerHashBE = dsha256(header);
           const targetBE = Buffer.from(job.targetHex, 'hex');
@@ -515,7 +508,7 @@ async function main() {
       console.log(`Client ${remoteAddress} disconnected`);
       clients.delete(socket);
     });
-    
+
     socket.on('error', (err) => {
       console.error(`Socket error for ${remoteAddress}:`, err);
       clients.delete(socket);
@@ -528,7 +521,7 @@ async function main() {
     console.log(`ASICBoost mask: ${VERSION_MASK_HEX}`);
     console.log(`Share difficulty: ${SHARE_DIFFICULTY}`);
   });
-  
+
   server.on('error', (err) => {
     console.error('Server error:', err);
     process.exit(1);
@@ -543,7 +536,7 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled rejection at:', promise, 'reason:', reason);
 });
 
-main().catch(e => { 
-  console.error('Fatal error:', e); 
-  process.exit(1); 
+main().catch(e => {
+  console.error('Fatal error:', e);
+  process.exit(1);
 });
