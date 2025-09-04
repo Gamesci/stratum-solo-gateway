@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Image to GHCR
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
 
     permissions:
       contents: read
-      packages: write   # 推送到 GHCR 需要这个权限
+      packages: write
 
     steps:
       - name: Checkout code
@@ -38,6 +38,6 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner.toLowerCase() }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ github.repository_owner.toLowerCase() }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           platforms: linux/amd64,linux/arm64
