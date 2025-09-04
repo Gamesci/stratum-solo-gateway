@@ -18,7 +18,22 @@ RUN if [ -f package-lock.json ]; then \
 # ===== 构建阶段 =====
 FROM node:20-alpine AS build
 WORKDIR /app
+
+# 安装构建依赖（tsc 等）
+RUN apk add --no-cache git python3 make g++
+
+# 复制生产依赖
 COPY --from=deps /app/node_modules ./node_modules
+COPY package.json package-lock.json* ./
+
+# 安装 devDependencies（typescript、ts-node 等）
+RUN if [ -f package-lock.json ]; then \
+      npm ci --only=dev; \
+    else \
+      npm install --only=dev; \
+    fi
+
+# 复制源码并编译
 COPY . .
 RUN npm run build
 
