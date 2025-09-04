@@ -305,11 +305,11 @@ async function subscribeZmqNewBlock() {
   sock.subscribe('hashblock');
   console.log(`ZMQ: Subscribed to new block notifications at ${ZMQ_BLOCK}`);
 
-  sock.on('error', err => {
-    console.error('ZMQ error:', err);
-    console.log('Reconnecting to ZMQ in 5s...');
-    setTimeout(() => subscribeZmqNewBlock().catch(console.error), 5000);
-  });
+(sock as any).on('error', (err: any) => {
+  console.error('ZMQ error:', err);
+  console.log('Reconnecting to ZMQ in 5s...');
+  setTimeout(() => subscribeZmqNewBlock().catch(console.error), 5000);
+});
 
   for await (const [topic, message] of sock) {
     if (topic.toString() === 'hashblock') {
