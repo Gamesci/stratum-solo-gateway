@@ -29,7 +29,7 @@ const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384');
 const ZMQ_BLOCK = process.env.ZMQ_BLOCK || 'tcp://bitcoin:28332';
 if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
 
-/* ===== Local RPC helper + retry ===== */
+/* ===== RPC helper + retry ===== */
 function rawRpc<T=any>(method: string, params: any[] = []): Promise<T> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
@@ -58,7 +58,6 @@ function rawRpc<T=any>(method: string, params: any[] = []): Promise<T> {
           if (parsed.error) reject(parsed.error);
           else resolve(parsed.result);
         } catch (e) {
-          console.error('RPC response parse error:', e, 'Data:', data);
           reject(e);
         }
       });
@@ -81,9 +80,7 @@ async function rpc<T=any>(method: string, params: any[] = [], retries = 3): Prom
       return await rawRpc<T>(method, params);
     } catch (e) {
       if (attempt === retries) throw e;
-      const backoffMs = 500 * attempt;
-      console.warn(`RPC ${method} failed (attempt ${attempt}), retrying in ${backoffMs}ms...`);
-      await new Promise(r => setTimeout(r, backoffMs));
+      await new Promise(r => setTimeout(r, 500 * attempt));
     }
   }
   throw new Error('unreachable');
@@ -99,11 +96,7 @@ type Gbt = {
   bits: string;
   curtime: number;
   height: number;
-  mutable?: string[];
-  target?: string;
-  rules?: string[];
   default_witness_commitment?: string;
-  weightlimit?: number;
 };
 type Job = {
   jobId: string;
@@ -132,7 +125,6 @@ type ClientState = {
 
 /* ===== Helpers ===== */
 const scriptPubKey = addressToScriptPubKey(PAYOUT_ADDRESS);
-
 function pushData(data: Buffer): Buffer {
   if (data.length < 0x4c) return Buffer.concat([Buffer.from([data.length]), data]);
   if (data.length <= 0xff) return Buffer.concat([Buffer.from([0x4c, data.length]), data]);
@@ -143,7 +135,6 @@ function pushData(data: Buffer): Buffer {
   const b = Buffer.allocUnsafe(4); b.writeUInt32LE(data.length, 0);
   return Buffer.concat([Buffer.from([0x4e]), b, data]);
 }
-
 function encodeScriptNumber(n: number): Buffer {
   const out: number[] = [];
   let x = n >>> 0;
@@ -152,39 +143,31 @@ function encodeScriptNumber(n: number): Buffer {
   if (out[out.length - 1] & 0x80) out.push(0);
   return Buffer.from(out);
 }
-
 function cryptoRandom(n: number) { return crypto.randomBytes(n); }
-
-// 标准 compact bits → target（与 Bitcoin Core 一致）
 function bitsToTargetHex(bitsHex: string) {
   const bits = Buffer.from(bitsHex, 'hex');
   const exp = bits.readUInt8(0);
   const mant = bits.readUIntBE(1, 3);
-  const shift = 8n * (BigInt(exp) - 3n);
-  let target = BigInt(mant);
-  if (shift > 0) target = target << shift;
+  let target = BigInt(mant) << (8n * (BigInt(exp) - 3n));
   return target.toString(16).padStart(64, '0');
 }
-
 function packHeader(versionHex: string, prevhashBE: string, merkleRoot: Buffer, ntimeHex8: string, nbitsHex: string, nonceHex8: string) {
-  const verLE = Buffer.from(versionHex, 'hex').reverse();
-  const prevLE = Buffer.from(prevhashBE, 'hex').reverse();
-  const rootLE = Buffer.from(merkleRoot).reverse();
-  const ntimeLE = Buffer.from(ntimeHex8, 'hex').reverse();
-  const nbitsLE = Buffer.from(nbitsHex, 'hex').reverse();
-  const nonceLE = Buffer.from(nonceHex8, 'hex').reverse();
-  return Buffer.concat([verLE, prevLE, rootLE, ntimeLE, nbitsLE, nonceLE]);
+  return Buffer.concat([
+    Buffer.from(versionHex, 'hex').reverse(),
+    Buffer.from(prevhashBE, 'hex').reverse(),
+    Buffer.from(merkleRoot).reverse(),
+    Buffer.from(ntimeHex8, 'hex').reverse(),
+    Buffer.from(nbitsHex, 'hex').reverse(),
+    Buffer.from(nonceHex8, 'hex').reverse()
+  ]);
 }
-
 function cmp256(a: Buffer, b: Buffer) {
   for (let i = 0; i < 32; i++) {
-    const x = a[i], y = b[i];
-    if (x < y) return true;
-    if (x > y) return false;
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
   }
   return true;
 }
-
 async function getTemplate(): Promise<Gbt> {
   return rpc<Gbt>('getblocktemplate', [{ rules: ['segwit'] }], 3);
 }
@@ -194,40 +177,26 @@ function buildJob(gbt: Gbt): Job {
   const mark = cryptoRandom(8);
   const cbMarked = buildCoinbaseRaw(mark, gbt.height, gbt.coinbasevalue);
   const idx = cbMarked.indexOf(mark);
-  if (idx < 0) throw new Error('Failed to locate extranonce splice point');
   const coinb1 = cbMarked.slice(0, idx).toString('hex');
   const coinb2 = cbMarked.slice(idx + mark.length).toString('hex');
-
-  const nonCbTxidsBE = gbt.transactions
-    .map(t => t.txid || t.hash)
-    .filter((x): x is string => !!x);
-
+  const nonCbTxidsBE = gbt.transactions.map(t => t.txid || t.hash).filter((x): x is string => !!x);
   const merkleBranchesLE = merkleBranchesForCoinbaseAt0(nonCbTxidsBE);
-
-  const prevhashBE = gbt.previousblockhash;
-  const prevhashLE = toLE(prevhashBE).toString('hex');
-
-  const nbits = gbt.bits;
-  const ntime = gbt.curtime.toString(16).padStart(8, '0');
-  const versionHex = gbt.version.toString(16).padStart(8, '0');
-
   return {
     jobId: `${gbt.height}-${Date.now().toString(16)}`,
     coinb1,
     coinb2,
     merkleBranchesLE,
-    versionHex,
+    versionHex: gbt.version.toString(16).padStart(8, '0'),
     versionBE: gbt.version >>> 0,
-    prevhashLE,
-    prevhashBE,
-    nbits,
-    ntime,
+    prevhashLE: toLE(gbt.previousblockhash).toString('hex'),
+    prevhashBE: gbt.previousblockhash,
+    nbits: gbt.bits,
+    ntime: gbt.curtime.toString(16).padStart(8, '0'),
     clean: true,
     targetHex: bitsToTargetHex(gbt.bits),
     gbt
   };
 }
-
 function buildCoinbaseRaw(extra: Buffer, height: number, value: number) {
   const heightScript = encodeScriptNumber(height);
   const tag = Buffer.from(COINBASE_TAG);
@@ -252,30 +221,23 @@ function buildCoinbaseRaw(extra: Buffer, height: number, value: number) {
 /* ===== bcoin: coinbase + full block ===== */
 function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string): TXType {
   const mtx = new MTX();
-
   const cbScript = new Script();
   cbScript.pushData(encodeScriptNumber(gbt.height));
   cbScript.pushData(Buffer.from(COINBASE_TAG));
   cbScript.pushData(extraNonce);
   cbScript.compile();
-
   mtx.addInput({
     prevout: new Outpoint(Buffer.alloc(32, 0), 0xffffffff),
     script: cbScript,
     sequence: 0xffffffff
   });
-
   const addr = Address.fromString(payoutAddr);
   mtx.addOutput({ address: addr, value: gbt.coinbasevalue });
-
-  // witness reserved value (32 bytes zeros)
   mtx.inputs[0].witness.push(Buffer.alloc(32, 0));
-
   if (gbt.default_witness_commitment) {
     const commitScript = Script.fromRaw(Buffer.from(gbt.default_witness_commitment, 'hex'));
     mtx.addOutput({ script: commitScript, value: 0 });
   }
-
   return mtx.toTX() as TXType;
 }
 
@@ -284,15 +246,13 @@ function buildFullBlock_bcoin(job: Job, coinbaseTx: TXType, versionBE: number, n
   block.version = versionBE >>> 0;
   block.prevBlock = Buffer.from(job.gbt.previousblockhash, 'hex').reverse();
   block.time = ntime >>> 0;
-  block.bits = parseInt(job.nbits, '16') >>> 0;
+  block.bits = parseInt(job.nbits, 16) >>> 0;
   block.nonce = nonceBE >>> 0;
-
   block.txs.push(coinbaseTx);
   for (const tx of job.gbt.transactions) {
     block.txs.push(TX.fromRaw(Buffer.from(tx.data, 'hex')));
   }
-
-  block.refresh(); // compute merkle/witness roots
+  block.refresh();
   return block as BlockType;
 }
 
@@ -306,11 +266,9 @@ function validateRolledVersion(baseVersion: number, submittedVersion: number, ma
 
 /* ===== Stratum ===== */
 const clients = new Map<net.Socket, ClientState>();
-
 function json(socket: net.Socket, id: any, result: any, error: any = null) {
   socket.write(JSON.stringify({ id, result, error }) + '\n');
 }
-
 function sendNotify(socket: net.Socket, job: Job) {
   const params = [
     job.jobId,
@@ -326,11 +284,9 @@ function sendNotify(socket: net.Socket, job: Job) {
   socket.write(JSON.stringify({ id: null, method: 'mining.notify', params }) + '\n');
   socket.write(JSON.stringify({ id: null, method: 'mining.set_difficulty', params: [SHARE_DIFFICULTY] }) + '\n');
 }
-
 function sendVersionMask(socket: net.Socket, maskHexNo0x: string) {
   socket.write(JSON.stringify({ id: null, method: 'mining.set_version_mask', params: [maskHexNo0x] }) + '\n');
 }
-
 function sendSetExtranonce(socket: net.Socket, state: ClientState) {
   socket.write(JSON.stringify({
     id: null,
@@ -338,8 +294,6 @@ function sendSetExtranonce(socket: net.Socket, state: ClientState) {
     params: [state.extranonce1.toString('hex'), EXTRANONCE2_SIZE]
   }) + '\n');
 }
-
-/* ===== Submit ===== */
 async function submitBlock(hexBlock: string) {
   return rpc('submitblock', [hexBlock], 3);
 }
@@ -350,17 +304,15 @@ async function subscribeZmqNewBlock() {
   sock.connect(ZMQ_BLOCK);
   sock.subscribe('hashblock');
   console.log(`ZMQ: Subscribed to new block notifications at ${ZMQ_BLOCK}`);
-
   for await (const [topic, message] of sock) {
     if (topic.toString() === 'hashblock') {
-      const blockHash = message.toString('hex');
-      console.log(`ZMQ: New block detected ${blockHash}, refreshing job...`);
+      console.log(`ZMQ: New block ${message.toString('hex')}, refreshing job...`);
       try {
         const gbt = await getTemplate();
         currentJob = buildJob(gbt);
         for (const [sock] of clients) sendNotify(sock, currentJob);
       } catch (e) {
-        console.error('ZMQ: Failed to refresh job after new block:', e);
+        console.error('ZMQ refresh error:', e);
       }
     }
   }
@@ -368,17 +320,11 @@ async function subscribeZmqNewBlock() {
 
 /* ===== Main ===== */
 let currentJob: Job;
-
 async function main() {
-  try {
-    currentJob = buildJob(await getTemplate());
-    console.log(`Initial job created for height ${currentJob.gbt.height}`);
-  } catch (e) {
-    console.error('Failed to create initial job:', e);
-    process.exit(1);
-  }
+  currentJob = buildJob(await getTemplate());
+  console.log(`Initial job created for height ${currentJob.gbt.height}`);
 
-  // 定时刷新（兜底）
+  // 定时刷新兜底
   setInterval(async () => {
     try {
       const gbt = await getTemplate();
@@ -396,10 +342,141 @@ async function main() {
     }
   }, REFRESH_MS);
 
-  // 启动 ZMQ 推送监听
   subscribeZmqNewBlock().catch(e => console.error('ZMQ subscription error:', e));
 
+  const server = net.createServer(socket => {
+    const remote = `${socket.remoteAddress}:${socket.remotePort}`;
+    const state: ClientState = {
+      id: Math.floor(Math.random() * 1e9),
+      extranonce1: cryptoRandom(4),
+      authorized: false,
+      extranonceSubscribed: false,
+      negotiatedVersionRolling: false,
+      versionMaskHex: VERSION_MASK_HEX.startsWith('0x') ? VERSION_MASK_HEX.slice(2) : VERSION_MASK_HEX,
+      jobs: new Map([[currentJob.jobId, currentJob]])
+    };
+    clients.set(socket, state);
+
+    socket.on('data', async buf => {
+      const lines = buf.toString().split('\n').map(s => s.trim()).filter(Boolean);
+      for (const line of lines) {
+        let msg: any;
+        try { msg = JSON.parse(line); } catch { continue; }
+        const { id, method, params } = msg;
+
+        if (method === 'mining.configure') {
+          state.negotiatedVersionRolling = true;
+          json(socket, id, { 'version-rolling': true, 'version-rolling.mask': state.versionMaskHex });
+          sendVersionMask(socket, state.versionMaskHex);
+          continue;
+        }
+        if (method === 'mining.extranonce.subscribe') {
+          state.extranonceSubscribed = true;
+          json(socket, id, true);
+          sendSetExtranonce(socket, state);
+          continue;
+        }
+        if (method === 'mining.subscribe') {
+          json(socket, id, [[['mining.set_difficulty', state.id], ['mining.notify', state.id]], state.extranonce1.toString('hex'), EXTRANONCE2_SIZE]);
+          sendNotify(socket, currentJob);
+          if (state.negotiatedVersionRolling) sendVersionMask(socket, state.versionMaskHex);
+          if (state.extranonceSubscribed) sendSetExtranonce(socket, state);
+          continue;
+        }
+        if (method === 'mining.authorize') {
+          state.authorized = true;
+          json(socket, id, true);
+          continue;
+        }
+        if (method === 'mining.submit') {
+          if (!state.authorized) { json(socket, id, false, { code: 24, message: 'Unauthorized' }); continue; }
+          const [worker, jobId, en2, ntimeHex, nonceHex, subVerHex] = params;
+          const job = state.jobs.get(jobId) || currentJob;
+          if (en2.length !== EXTRANONCE2_SIZE * 2) { json(socket, id, false, { code: 20, message: 'Invalid extranonce2 size' }); continue; }
+          const coinbaseHex = job.coinb1 + state.extranonce1.toString('hex') + en2 + job.coinb2;
+          let root = dsha256(Buffer.from(coinbaseHex, 'hex'));
+          for (const branchHexLE of job.merkleBranchesLE) {
+            const branch = Buffer.from(branchHexLE, 'hex');
+            root = dsha256(Buffer.concat([root, branch]));
+          }
+
+          // 版本号处理（version rolling）
+          let versionHex = job.versionHex;
+          let versionBE = job.versionBE;
+          if (subVerHex && state.negotiatedVersionRolling) {
+            const subV = parseInt(subVerHex, 16) >>> 0;
+            if (!validateRolledVersion(job.versionBE, subV, VERSION_MASK)) {
+              json(socket, id, false, { code: 22, message: 'Invalid version rolling beyond mask' });
+              continue;
+            }
+            versionHex = subV.toString(16).padStart(8, '0');
+            versionBE = subV >>> 0;
+          }
+
+          // 检查目标难度
+          const header = packHeader(versionHex, job.prevhashBE, root, ntimeHex, job.nbits, nonceHex);
+          const headerHashBE = dsha256(header);
+          const targetBE = Buffer.from(job.targetHex, 'hex');
+          const meets = cmp256(headerHashBE, targetBE);
+
+          if (meets) {
+            console.log(`Potential block found by ${worker} | height=${job.gbt.height}`);
+            try {
+              const extraNonce = Buffer.from(state.extranonce1.toString('hex') + en2, 'hex');
+              const coinbaseTX = buildCoinbaseTX_bcoin(job.gbt, extraNonce, PAYOUT_ADDRESS);
+              const ntimeBE = parseInt(ntimeHex, 16) >>> 0;
+              const nonceBE = parseInt(nonceHex, 16) >>> 0;
+              const block = buildFullBlock_bcoin(job, coinbaseTX, versionBE, ntimeBE, nonceBE);
+              const raw = block.toRaw();
+              await submitBlock(raw.toString('hex'));
+              console.log(`BLOCK SUBMITTED by ${worker} | height=${job.gbt.height} | version=${versionHex}`);
+            } catch (e) {
+              console.error('Block construction/submission error:', e);
+            }
+          } else {
+            console.log(`Share accepted from ${worker} | height=${job.gbt.height}`);
+          }
+
+          json(socket, id, true);
+          continue;
+        }
+
+        // 未知方法
+        json(socket, id, null, { code: -3, message: 'Unknown method' });
+      }
+    });
+
+    socket.on('close', () => {
+      console.log(`Client ${remote} disconnected`);
+      clients.delete(socket);
+    });
+
+    socket.on('error', (err) => {
+      console.error(`Socket error for ${remote}:`, err);
+      clients.delete(socket);
+    });
+  });
+
+  server.listen(parseInt(PORT, 10), HOST, () => {
+    console.log(`Stratum solo server listening on ${HOST}:${PORT}`);
+    console.log(`Payout address: ${PAYOUT_ADDRESS}`);
+    console.log(`ASICBoost mask: ${VERSION_MASK_HEX}`);
+    console.log(`Share difficulty: ${SHARE_DIFFICULTY}`);
+  });
+
+  server.on('error', (err) => {
+    console.error('Server error:', err);
+    process.exit(1);
+  });
 }
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+});
 
 main().catch(e => {
   console.error('Fatal error:', e);
