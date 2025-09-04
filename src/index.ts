@@ -182,7 +182,7 @@ function buildJob(gbt: Gbt): Job {
   const nonCbTxidsBE = gbt.transactions.map(t => t.txid || t.hash).filter((x): x is string => !!x);
   const merkleBranchesLE = merkleBranchesForCoinbaseAt0(nonCbTxidsBE);
   return {
-    jobId: `${gbt.height}-${Date.now().toString(16)}`,
+    jobId: Buffer.from(`${gbt.height}-${Date.now().toString(16)}`).toString('hex'),
     coinb1,
     coinb2,
     merkleBranchesLE,
@@ -298,12 +298,19 @@ async function submitBlock(hexBlock: string) {
   return rpc('submitblock', [hexBlock], 3);
 }
 
-/* ===== ZMQ 新块推送 ===== */
+/* ===== ZMQ 新块推送（带自动重连） ===== */
 async function subscribeZmqNewBlock() {
   const sock = new zmq.Subscriber();
   sock.connect(ZMQ_BLOCK);
   sock.subscribe('hashblock');
   console.log(`ZMQ: Subscribed to new block notifications at ${ZMQ_BLOCK}`);
+
+  sock.on('error', err => {
+    console.error('ZMQ error:', err);
+    console.log('Reconnecting to ZMQ in 5s...');
+    setTimeout(() => subscribeZmqNewBlock().catch(console.error), 5000);
+  });
+
   for await (const [topic, message] of sock) {
     if (topic.toString() === 'hashblock') {
       console.log(`ZMQ: New block ${message.toString('hex')}, refreshing job...`);
@@ -392,7 +399,11 @@ async function main() {
           if (!state.authorized) { json(socket, id, false, { code: 24, message: 'Unauthorized' }); continue; }
           const [worker, jobId, en2, ntimeHex, nonceHex, subVerHex] = params;
           const job = state.jobs.get(jobId) || currentJob;
-          if (en2.length !== EXTRANONCE2_SIZE * 2) { json(socket, id, false, { code: 20, message: 'Invalid extranonce2 size' }); continue; }
+          if (en2.length !== EXTRANONCE2_SIZE * 2) {
+            json(socket, id, false, { code: 20, message: 'Invalid extranonce2 size' });
+            continue;
+          }
+
           const coinbaseHex = job.coinb1 + state.extranonce1.toString('hex') + en2 + job.coinb2;
           let root = dsha256(Buffer.from(coinbaseHex, 'hex'));
           for (const branchHexLE of job.merkleBranchesLE) {
