@@ -9,6 +9,10 @@ import {
 import bcoin from 'bcoin';
 const { Block, TX, MTX, Script, Outpoint, Address } = bcoin;
 
+// ==== 类型别名（解决 TS2749）====
+type TXType = InstanceType<typeof TX>;
+type BlockType = InstanceType<typeof Block>;
+
 /* ========== 环境变量 ========== */
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8332';
 const RPC_USER = process.env.RPC_USER || 'user';
@@ -20,7 +24,7 @@ const EXTRANONCE2_SIZE = parseInt(process.env.EXTRANONCE2_SIZE || '4', 10);
 const REFRESH_MS = parseInt(process.env.REFRESH_MS || '10000', 10);
 const VERSION_MASK_HEX = (process.env.VERSION_MASK || '0x1fffe000').toString().toLowerCase();
 const VERSION_MASK = BigInt(VERSION_MASK_HEX);
-const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384'); // 可选：允许通过 env 调整 share 难度
+const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384');
 
 if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
 
@@ -53,7 +57,7 @@ function rpc<T=any>(method: string, params: any[] = []): Promise<T> {
   });
 }
 
-/* ========== 类型 ========== */
+/* ========== 类型定义 ========== */
 type GbtTx = { data: string; txid: string };
 type Gbt = {
   version: number;
@@ -71,7 +75,7 @@ type Job = {
   coinb1: string;
   coinb2: string;
   merkleBranches: string[];
-  versionHex: string;     // 模板 version（大端 8 hex）
+  versionHex: string;
   versionBE: number;
   prevhash: string;
   nbits: string;
@@ -87,11 +91,11 @@ type ClientState = {
   authorized: boolean;
   extranonceSubscribed: boolean;
   negotiatedVersionRolling: boolean;
-  versionMaskHex: string; // 不带 0x 的 hex
+  versionMaskHex: string;
   jobs: Map<string, Job>;
 };
 
-/* ========== 工具 ========== */
+/* ========== 工具函数 ========== */
 const scriptPubKey = addressToScriptPubKey(PAYOUT_ADDRESS);
 
 function pushData(data: Buffer): Buffer {
@@ -140,7 +144,7 @@ function packHeader(versionHex: string, prevhashHex: string, merkleRoot: Buffer,
   return Buffer.concat([verLE, prevLE, rootLE, ntimeLE, nbitsLE, nonceLE]);
 }
 
-function cmp256(a: Buffer, b: Buffer) { // a<=b? (big-endian)
+function cmp256(a: Buffer, b: Buffer) {
   for (let i = 0; i < 32; i++) {
     const x = a[i], y = b[i];
     if (x < y) return true;
@@ -153,19 +157,15 @@ async function getTemplate(): Promise<Gbt> {
   return rpc<Gbt>('getblocktemplate', [{ rules: ['segwit'] }]);
 }
 
-/* ========== 构造 Stratum 任务 ========== */
+/* ========== 构造任务 ========== */
 function buildJob(gbt: Gbt): Job {
-  // 用标记字节划分 coinbase，便于插入 extranonce1+2
   const mark = cryptoRandom(8);
   const cbMarked = buildCoinbaseRaw(mark, gbt.height, gbt.coinbasevalue);
   const idx = cbMarked.indexOf(mark);
   if (idx < 0) throw new Error('Failed to locate extranonce splice point');
   const coinb1 = cbMarked.slice(0, idx).toString('hex');
   const coinb2 = cbMarked.slice(idx + mark.length).toString('hex');
-
-  // Stratum merkle 分支：提供 coinbase 的兄弟路径（简化：按 tx 列表顺序折叠）
   const branches = gbt.transactions.map(t => fromLE(toLE(t.txid)));
-
   const prevhash = toLE(gbt.previousblockhash).toString('hex');
   const nbits = gbt.bits;
   const ntime = gbt.curtime.toString(16);
@@ -187,7 +187,6 @@ function buildJob(gbt: Gbt): Job {
   };
 }
 
-/* ========== 使用手写 coinbase 原型确定 split（bcoin 最终用于规范化区块构建） ========== */
 function buildCoinbaseRaw(extra: Buffer, height: number, value: number) {
   const heightScript = encodeScriptNumber(height);
   const tag = Buffer.from(COINBASE_TAG);
@@ -217,15 +216,15 @@ function buildCoinbaseRaw(extra: Buffer, height: number, value: number) {
   ]);
 }
 
-/* ========== bcoin：构造 coinbase（含 witness 承诺）与整块 ========== */
-function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string): TX {
+/* ========== bcoin 构造 coinbase（含 witness 承诺）与整块 ========== */
+function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string): TXType {
   const mtx = new MTX();
 
   // coinbase input
   const cbScript = new Script();
-  cbScript.pushInt(gbt.height);                    // BIP34 高度
-  cbScript.pushData(Buffer.from(COINBASE_TAG));    // coinbase 标识
-  cbScript.pushData(extraNonce);                   // extranonce1+2
+  cbScript.pushInt(gbt.height);
+  cbScript.pushData(Buffer.from(COINBASE_TAG));
+  cbScript.pushData(extraNonce);
   cbScript.compile();
 
   mtx.addInput({
@@ -234,18 +233,17 @@ function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string)
     sequence: 0xffffffff
   });
 
-  // 主输出：直付到你的地址
+  // 主输出
   const addr = Address.fromString(payoutAddr);
   mtx.addOutput({
     address: addr,
     value: gbt.coinbasevalue
   });
 
-  // witness reserved value（32 bytes 全 0）放在 coinbase 输入的 witness[0]
-  // 这用于计算默认的 witness commitment（如果模板要求）
+  // witness reserved value
   mtx.inputs[0].witness.push(Buffer.alloc(32, 0));
 
-  // 如果 GBT 提供了 default_witness_commitment（一个 OP_RETURN scriptPubKey 原始 hex）
+  // witness commitment
   if (gbt.default_witness_commitment) {
     const commitScript = Script.fromRaw(Buffer.from(gbt.default_witness_commitment, 'hex'));
     mtx.addOutput({
@@ -254,10 +252,10 @@ function buildCoinbaseTX_bcoin(gbt: Gbt, extraNonce: Buffer, payoutAddr: string)
     });
   }
 
-  return mtx.toTX();
+  return mtx.toTX() as TXType;
 }
 
-function buildFullBlock_bcoin(job: Job, coinbaseTx: TX, versionBE: number, ntime: number, nonceBE: number): Block {
+function buildFullBlock_bcoin(job: Job, coinbaseTx: TXType, versionBE: number, ntime: number, nonceBE: number): BlockType {
   const block = new Block();
   block.version = versionBE >>> 0;
   block.prevBlock = Buffer.from(job.gbt.previousblockhash, 'hex').reverse();
@@ -265,15 +263,13 @@ function buildFullBlock_bcoin(job: Job, coinbaseTx: TX, versionBE: number, ntime
   block.bits = parseInt(job.nbits, 16) >>> 0;
   block.nonce = nonceBE >>> 0;
 
-  // 添加交易（coinbase + GBT 给定的 mempool tx）
   block.txs.push(coinbaseTx);
   for (const tx of job.gbt.transactions) {
     block.txs.push(TX.fromRaw(Buffer.from(tx.data, 'hex')));
   }
 
-  // 刷新计算 merkle/witness 根
   block.refresh();
-  return block;
+  return block as BlockType;
 }
 
 /* ========== 版本滚动校验（ASICBoost） ========== */
@@ -328,7 +324,6 @@ async function submitBlock(hexBlock: string) {
 async function main() {
   let currentJob = buildJob(await getTemplate());
 
-  // 定期刷新模板
   setInterval(async () => {
     try {
       const gbt = await getTemplate();
@@ -362,23 +357,19 @@ async function main() {
         try { msg = JSON.parse(line); } catch { continue; }
         const { id, method, params } = msg;
 
-        // 扩展：mining.configure（协商 version-rolling）
         if (method === 'mining.configure') {
           state.negotiatedVersionRolling = true;
-          const result = {
+          json(socket, id, {
             'version-rolling': true,
             'version-rolling.mask': state.versionMaskHex
-          };
-          json(socket, id, result);
+          });
           sendVersionMask(socket, state.versionMaskHex);
           continue;
         }
 
-        // 扩展：mining.extranonce.subscribe
         if (method === 'mining.extranonce.subscribe') {
           state.extranonceSubscribed = true;
           json(socket, id, true);
-          // 立即回发当前的 set_extranonce
           sendSetExtranonce(socket, state);
           continue;
         }
@@ -399,7 +390,6 @@ async function main() {
         }
 
         if (method === 'mining.submit') {
-          // [worker, job_id, extranonce2, ntime, nonce] 或 [.., version]
           const worker = params[0];
           const jobId: string = params[1];
           const en2: string = params[2];
@@ -408,26 +398,21 @@ async function main() {
           const submittedVersionHex: string | undefined = params[5];
 
           const job = state.jobs.get(jobId) || currentJob;
-
-          // coinbase = coinb1 + en1 + en2 + coinb2
           const extranonce1Hex = state.extranonce1.toString('hex');
           const coinbaseHex = job.coinb1 + extranonce1Hex + en2 + job.coinb2;
           const coinbaseBuf = Buffer.from(coinbaseHex, 'hex');
 
-          // 计算 header 用的 merkle root
           let root = dsha256(coinbaseBuf);
           for (const branchHex of job.merkleBranches) {
             const branch = Buffer.from(branchHex, 'hex');
             root = dsha256(Buffer.concat([root, branch]));
           }
 
-          // 处理版本滚动
           let versionHex = job.versionHex;
           let versionBE = job.versionBE;
           if (submittedVersionHex && state.negotiatedVersionRolling) {
             const subV = parseInt(submittedVersionHex, 16) >>> 0;
-            const ok = validateRolledVersion(job.versionBE, subV, VERSION_MASK);
-            if (!ok) {
+            if (!validateRolledVersion(job.versionBE, subV, VERSION_MASK)) {
               json(socket, id, false, { code: 22, message: 'Invalid version rolling beyond mask' });
               continue;
             }
@@ -435,7 +420,6 @@ async function main() {
             versionBE = subV >>> 0;
           }
 
-          // 校验是否满足网络难度
           const header = packHeader(versionHex, job.prevhash, root, ntimeHex, job.nbits, nonceHex);
           const headerHashBE = dsha256(header);
           const targetBE = Buffer.from(job.targetHex, 'hex');
@@ -443,7 +427,6 @@ async function main() {
 
           if (meets) {
             try {
-              // 使用 bcoin 规范构建 coinbase（含 witness 承诺）
               const extraNonce = Buffer.from(extranonce1Hex + en2, 'hex');
               const coinbaseTX = buildCoinbaseTX_bcoin(job.gbt, extraNonce, PAYOUT_ADDRESS);
 
@@ -461,11 +444,12 @@ async function main() {
             }
           }
 
-          // solo 模式：对 submit 一律返回 true（不做 share 计分）
+          // solo 模式：无论是否满足网络难度，share 都返回 true
           json(socket, id, true);
           continue;
         }
 
+        // 未知方法
         json(socket, id, null, { code: -3, message: 'Unknown method' });
       }
     });
