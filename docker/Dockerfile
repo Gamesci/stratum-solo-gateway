@@ -7,11 +7,12 @@ RUN apk add --no-cache git python3 make g++
 # 设置工作目录
 WORKDIR /app
 
-# 复制 package.json 和 package-lock.json
-COPY package*.json ./
+# 复制 package.json
+COPY package.json ./
 
-# 使用 npm ci 而不是 npm install 以确保依赖一致性
-RUN npm ci --only=production
+# 生成 package-lock.json 并安装依赖
+RUN npm install --package-lock-only && \
+    npm ci --omit=dev
 
 # 复制源代码
 COPY . .
@@ -21,9 +22,6 @@ RUN npm run build
 
 # 最终阶段
 FROM node:20-alpine
-
-# 安装运行时依赖（如需要）
-RUN apk add --no-cache tini
 
 # 设置工作目录
 WORKDIR /app
@@ -40,9 +38,6 @@ RUN addgroup -g 1001 -S nodejs && \
 
 # 切换到非root用户
 USER bitcoin
-
-# 使用tini作为初始化进程来处理信号
-ENTRYPOINT ["/sbin/tini", "--"]
 
 # 暴露Stratum端口
 EXPOSE 3333
