@@ -1,43 +1,23 @@
-# ===== 依赖构建阶段 =====
-FROM node:20-alpine AS deps
-WORKDIR /app
+FROM node:20-alpine
 
-# 安装构建依赖（支持从 Git 拉包）
+# 安装构建依赖
 RUN apk add --no-cache git python3 make g++
 
-# 复制依赖清单
-COPY package.json package-lock.json* ./
-
-# 如果有 lock 文件就用 npm ci，否则用 npm install
-RUN if [ -f package-lock.json ]; then \
-      npm ci --omit=dev; \
-    else \
-      npm install --omit=dev; \
-    fi
-
-# ===== 构建阶段 =====
-FROM node:20-alpine AS build
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+
+# 复制项目文件
 COPY . .
-RUN npm run build
 
-# ===== 运行阶段 =====
-FROM node:20-alpine AS runtime
-WORKDIR /app
+# 安装依赖并构建
+RUN npm install && npm run build
 
-# 使用 tini 作为 init 进程（可选，提升信号处理）
-RUN apk add --no-cache tini
+# 创建非root用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S bitcoin -u 1001 && \
+    chown -R bitcoin:nodejs /app
 
-# 复制运行所需文件
-COPY --from=build /app/dist ./dist
-COPY package.json ./
-COPY --from=deps /app/node_modules ./node_modules
-
-# 创建非 root 用户运行
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-USER appuser
+USER bitcoin
 
 EXPOSE 3333
-ENTRYPOINT ["/sbin/tini", "--"]
+
 CMD ["node", "dist/index.js"]
