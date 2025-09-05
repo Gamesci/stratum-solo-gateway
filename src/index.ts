@@ -191,8 +191,7 @@ function buildJob(gbt: Gbt): Job {
     prevhashLE: toLE(gbt.previousblockhash).toString('hex'),
     prevhashBE: gbt.previousblockhash,
     nbits: gbt.bits,
-    const adjustedTime = gbt.curtime + 1;
-    ntime: adjustedTime.toString(16).padStart(8, '0'),
+    ntime: (gbt.curtime + 1).toString(16).padStart(8, '0'),
     clean: true,
     targetHex: bitsToTargetHex(gbt.bits),
     gbt
