@@ -201,7 +201,13 @@ function buildJob(gbt: Gbt): Job {
 function buildCoinbaseRaw(extra: Buffer, height: number, value: number) {
   const heightScript = encodeScriptNumber(height);
   const tag = Buffer.from(COINBASE_TAG);
-  const scriptSig = Buffer.concat([pushData(heightScript), pushData(tag), pushData(extra)]);
+  const signature = Buffer.from("Bitaxe", "utf8");
+  const scriptSig = Buffer.concat([
+    pushData(heightScript),
+    pushData(tag),
+    pushData(signature),
+    pushData(extra)
+  ]);
   const coinbaseIn = Buffer.concat([
     Buffer.alloc(32, 0),
     Buffer.alloc(4, 0xff),
