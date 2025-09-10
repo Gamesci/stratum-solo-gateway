@@ -3,7 +3,6 @@ name: Build and Push Docker Image to GHCR
 on:
   push:
     branches:
-      - main
   workflow_dispatch:
 
 env:
@@ -42,6 +41,6 @@ jobs:
           file: docker/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:main
             ghcr.io/${{ env.OWNER_LC }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           platforms: linux/amd64,linux/arm64
