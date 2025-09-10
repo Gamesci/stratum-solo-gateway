@@ -15,9 +15,11 @@ type TXType = InstanceType<typeof TX>;
 type BlockType = InstanceType<typeof Block>;
 
 /* ===== Env ===== */
+const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8332';
+const RPC_USER = process.env.RPC_USER || 'user';
+const RPC_PASS = process.env.RPC_PASS || 'pass';
 const [HOST, PORT] = (process.env.LISTEN || '0.0.0.0:3333').split(':');
-const PAYOUT_ADDRESS = process.env.PAYOUT_ADDRESS;
-if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
+const PAYOUT_ADDRESS = process.env.PAYOUT_ADDRESS!;
 const COINBASE_TAG = (process.env.COINBASE_TAG || '/SoloGateway/').trim();
 const EXTRANONCE2_SIZE = parseInt(process.env.EXTRANONCE2_SIZE || '4', 10);
 const REFRESH_MS = parseInt(process.env.REFRESH_MS || '10000', 10);
@@ -25,6 +27,7 @@ const VERSION_MASK_HEX = (process.env.VERSION_MASK || '0x1fffe000').toString().t
 const VERSION_MASK = BigInt(VERSION_MASK_HEX);
 const SHARE_DIFFICULTY = parseFloat(process.env.SHARE_DIFFICULTY || '16384');
 const ZMQ_BLOCK = process.env.ZMQ_BLOCK || 'tcp://bitcoin:28332';
+if (!PAYOUT_ADDRESS) throw new Error('PAYOUT_ADDRESS required');
 
 /* ===== RPC helper + retry ===== */
 function rawRpc<T=any>(method: string, params: any[] = []): Promise<T> {
