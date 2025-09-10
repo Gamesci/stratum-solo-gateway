@@ -411,19 +411,18 @@ async function main() {
             root = dsha256(Buffer.concat([root, branch]));
           }
 
-// 版本号处理（version rolling）
-let versionHex = job.versionHex;
-let versionBE = job.versionBE;
-
-if (typeof subVerHex === 'string' && state.negotiatedVersionRolling) {
-  const subV = parseInt(subVerHex, 16) >>> 0;
-  if (!validateRolledVersion(job.versionBE, subV, VERSION_MASK)) {
-    json(socket, id, false, { code: 22, message: 'Invalid version rolling beyond mask' });
-    continue;
-  }
-  versionHex = subV.toString(16).padStart(8, '0');
-  versionBE = subV >>> 0;
-}
+          // 版本号处理（version rolling）
+          let versionHex = job.versionHex;
+          let versionBE = job.versionBE;
+          if (subVerHex && state.negotiatedVersionRolling) {
+            const subV = parseInt(subVerHex, 16) >>> 0;
+            if (!validateRolledVersion(job.versionBE, subV, VERSION_MASK)) {
+              json(socket, id, false, { code: 22, message: 'Invalid version rolling beyond mask' });
+              continue;
+            }
+            versionHex = subV.toString(16).padStart(8, '0');
+            versionBE = subV >>> 0;
+          }
 
           // 检查目标难度
           const header = packHeader(versionHex, job.prevhashBE, root, ntimeHex, job.nbits, nonceHex);
