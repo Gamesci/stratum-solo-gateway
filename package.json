@@ -1,26 +1,28 @@
 {
   "name": "stratum-solo-gateway",
-  "version": "0.3.0",
-  "description": "A pure solo Bitcoin Stratum gateway with ASICBoost, extranonce subscription, and bcoin witness commitment support.",
+  "version": "1.0.0",
+  "description": "A Bitcoin solo mining Stratum gateway with strict consensus compliance",
   "type": "module",
+  "main": "dist/index.js",
   "scripts": {
-    "dev": "ts-node-esm src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "lint": "eslint . --ext .ts"
   },
   "dependencies": {
-    "bech32": "^2.0.0",
     "bcoin": "git+https://github.com/bcoin-org/bcoin.git#master",
+    "bech32": "^2.0.0",
     "zeromq": "^6.0.0"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.5.4"
+    "eslint": "^8.57.0"
   },
-  "license": "MIT",
-  "author": "Gamesci",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Gamesci/stratum-solo-gateway.git"
-  }
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
 }
