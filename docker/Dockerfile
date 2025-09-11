@@ -1,52 +1,29 @@
-# ===== 依赖构建阶段 =====
-FROM node:20-alpine AS deps
-WORKDIR /app
-
-RUN apk add --no-cache git python3 make g++
-
-COPY package.json package-lock.json* ./
-
-# 安装生产依赖
-RUN if [ -f package-lock.json ]; then \
-      npm ci --omit=dev; \
-    else \
-      npm install --omit=dev; \
-    fi
-
-# ===== 构建阶段 =====
+# ===== Stage 1: Build =====
 FROM node:20-alpine AS build
 WORKDIR /app
 
-RUN apk add --no-cache git python3 make g++
+# 先复制依赖清单，利用缓存
+COPY package*.json tsconfig.json ./
+RUN npm ci
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY package.json package-lock.json* ./
-
-# 安装开发依赖（新版 npm 用 --include=dev）
-RUN npm install -g npm@latest \
- && if [ -f package-lock.json ]; then \
-      npm ci --include=dev; \
-    else \
-      npm install --include=dev; \
-    fi \
- && npm audit fix || true
-
-COPY . .
+# 复制源码并编译
+COPY src ./src
 RUN npm run build
 
-# ===== 运行阶段 =====
-FROM node:20-alpine AS runtime
+# ===== Stage 2: Runtime =====
+FROM node:20-alpine
 WORKDIR /app
 
-RUN apk add --no-cache tini
-
+# 仅复制运行所需文件
 COPY --from=build /app/dist ./dist
-COPY package.json ./
-COPY --from=deps /app/node_modules ./node_modules
+COPY package*.json ./
+RUN npm ci --omit=dev
 
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-USER appuser
+# 设置生产环境变量
+ENV NODE_ENV=production
 
+# 暴露 Stratum 端口（可在 .env 中配置）
 EXPOSE 3333
-ENTRYPOINT ["/sbin/tini", "--"]
+
+# 默认启动命令
 CMD ["node", "dist/index.js"]
