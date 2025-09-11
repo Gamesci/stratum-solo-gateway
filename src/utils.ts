@@ -1,6 +1,7 @@
 import { bech32 } from 'bech32';
 import crypto from 'crypto';
 
+/* ===== 哈希 ===== */
 export function sha256(buf: Buffer) {
   return crypto.createHash('sha256').update(buf).digest();
 }
@@ -8,7 +9,7 @@ export function dsha256(buf: Buffer) {
   return sha256(sha256(buf));
 }
 
-// hex 大端 <-> 小端转换
+/* ===== 大小端转换 ===== */
 export function toLE(hex: string) {
   return Buffer.from(hex, 'hex').reverse();
 }
@@ -16,7 +17,7 @@ export function fromLE(buf: Buffer) {
   return Buffer.from(buf).reverse().toString('hex');
 }
 
-// 编码
+/* ===== 编码 ===== */
 export function varint(n: number): Buffer {
   if (n < 0xfd) return Buffer.from([n]);
   if (n <= 0xffff) return Buffer.concat([Buffer.from([0xfd]), u16(n)]);
@@ -36,16 +37,16 @@ export function u64(n: bigint) {
   return b;
 }
 
-// 标准 compact bits → target 算法（与 Bitcoin Core 一致）
+/* ===== bits → target（Bitcoin Core 一致） ===== */
 export function bitsToTargetHex(bitsHex: string) {
-  const bits = Buffer.from(bitsHex, 'hex').reverse();
+  const bits = Buffer.from(bitsHex, 'hex').reverse(); // LE 存储
   const exponent = bits[3];
   const mantissa = bits.readUInt32LE(0) & 0x00ffffff;
-  let target = BigInt(mantissa) * (1n << (8n * (BigInt(exponent) - 3n)));
+  const target = BigInt(mantissa) * (1n << (8n * (BigInt(exponent) - 3n)));
   return target.toString(16).padStart(64, '0');
 }
 
-// 计算“coinbase 位于索引 0”的 Stratum merkle_branch（输出每层兄弟节点，小端 hex）
+/* ===== Merkle 分支（coinbase 在索引 0） ===== */
 export function merkleBranchesForCoinbaseAt0(txidsBE: string[]): string[] {
   const leaves: Buffer[] = [Buffer.alloc(32, 0)]; // coinbase 占位
   for (const txid of txidsBE) leaves.push(toLE(txid));
@@ -74,7 +75,7 @@ export function merkleBranchesForCoinbaseAt0(txidsBE: string[]): string[] {
   return branches.map(b => b.toString('hex'));
 }
 
-// 地址转脚本
+/* ===== 地址转脚本 ===== */
 export type ScriptPubKey = Buffer;
 
 export function addressToScriptPubKey(addr: string): ScriptPubKey {
