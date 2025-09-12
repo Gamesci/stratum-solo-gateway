@@ -243,9 +243,17 @@ function json(socket: net.Socket, id: any, result: any, error: any = null) {
 }
 
 function sendNotifyTo(socket: net.Socket, job: Job) {
-  // Sync job into client state to prevent jobId mismatch
+  // 同步 job 到客户端状态，防止 jobId 不匹配
   const st = clients.get(socket);
-  if (st) st.jobs.set(job.jobId, job);
+  if (st) {
+    st.jobs.set(job.jobId, job);
+
+    // 自动清理旧 job，只保留最近 3 个，防止内存增长
+    if (st.jobs.size > 3) {
+      const firstKey = st.jobs.keys().next().value;
+      st.jobs.delete(firstKey);
+    }
+  }
 
   const params = [
     job.jobId,
@@ -259,8 +267,8 @@ function sendNotifyTo(socket: net.Socket, job: Job) {
     job.clean
   ];
   socket.write(JSON.stringify({ id: null, method: 'mining.notify', params }) + '\n');
-  // 兜底：再次下发难度，确保矿机同步
-  socket.write(JSON.stringify({ id: null, method: 'mining.set_difficulty', params: [SHARE_DIFFICULTY] }) + '\n');
+
+  // 已移除：每次下发作业都附带 set_difficulty 的兜底发送
 }
 
 function sendVersionMask(socket: net.Socket, maskHexNo0x: string) {
