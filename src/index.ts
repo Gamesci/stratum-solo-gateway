@@ -250,7 +250,7 @@ function sendNotifyTo(socket: net.Socket, job: Job) {
 
     // 自动清理旧 job，只保留最近 3 个，防止内存增长
     if (st.jobs.size > 3) {
-      const firstKey = st.jobs.keys().next().value;
+      const firstKey = st.jobs.keys().next().value!;
       st.jobs.delete(firstKey);
     }
   }
