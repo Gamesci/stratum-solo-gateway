@@ -143,7 +143,7 @@ async function submitBlock(hexBlock: string) {
 }
 
 /* ===== Job builder ===== */
-function buildJob(gbt: Gbt): Job {
+function buildJob(gbt: Gbt, clean: boolean): Job {
   const mark = cryptoRandom(8);
   const cbMarked = buildCoinbaseRaw(mark, gbt.height, gbt.coinbasevalue);
   const idx = cbMarked.indexOf(mark);
@@ -165,7 +165,7 @@ function buildJob(gbt: Gbt): Job {
     prevhashBE: gbt.previousblockhash,
     nbits: gbt.bits,
     ntime: gbt.curtime.toString(16).padStart(8, '0'),
-    clean: true,
+    clean,
     targetHex: bitsToTargetHex(gbt.bits),
     gbt
   };
@@ -287,7 +287,7 @@ async function subscribeZmqNewBlock() {
         console.log(`ZMQ: New block ${message.toString('hex')}, refreshing job...`);
         try {
           const gbt = await getTemplate();
-          currentJob = buildJob(gbt);
+          currentJob = buildJob(gbt, true); // 新区块 clean_jobs = true
           for (const [clientSock] of clients) sendNotifyTo(clientSock, currentJob);
         } catch (e) {
           console.error('ZMQ refresh error:', e);
@@ -309,10 +309,10 @@ async function subscribeZmqNewBlock() {
 let currentJob: Job;
 
 async function main() {
-  currentJob = buildJob(await getTemplate());
+  currentJob = buildJob(await getTemplate(), true);
   console.log(`Initial job created for height ${currentJob.gbt.height}`);
 
-  // 定时刷新兜底
+  // 定时刷新兜底（非新区块 clean_jobs = false）
   setInterval(async () => {
     try {
       const gbt = await getTemplate();
@@ -321,8 +321,9 @@ async function main() {
         gbt.curtime !== currentJob.gbt.curtime ||
         gbt.transactions.length !== currentJob.gbt.transactions.length
       ) {
-        currentJob = buildJob(gbt);
-        console.log(`New job created for height ${currentJob.gbt.height}`);
+        const isNewBlock = gbt.previousblockhash !== currentJob.gbt.previousblockhash;
+        currentJob = buildJob(gbt, isNewBlock);
+        console.log(`New job created for height ${currentJob.gbt.height} | clean_jobs=${isNewBlock}`);
         for (const [sock] of clients) sendNotifyTo(sock, currentJob);
       }
     } catch (e) {
