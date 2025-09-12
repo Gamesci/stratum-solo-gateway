@@ -154,6 +154,9 @@ function buildJob(gbt: Gbt, clean: boolean): Job {
   const nonCbTxidsBE = gbt.transactions.map(t => t.txid || t.hash).filter((x): x is string => !!x);
   const merkleBranchesLE = merkleBranchesForCoinbaseAt0(nonCbTxidsBE);
 
+  // ntime 提前 2 秒，缓冲网络延迟/丢包/本地 I/O 等
+  const adjustedTime = gbt.curtime + 2;
+
   return {
     jobId: Buffer.from(`${gbt.height}-${Date.now().toString(16)}`).toString('hex'),
     coinb1,
@@ -164,7 +167,7 @@ function buildJob(gbt: Gbt, clean: boolean): Job {
     prevhashLE: toLE(gbt.previousblockhash).toString('hex'),
     prevhashBE: gbt.previousblockhash,
     nbits: gbt.bits,
-    ntime: gbt.curtime.toString(16).padStart(8, '0'),
+    ntime: adjustedTime.toString(16).padStart(8, '0'),
     clean,
     targetHex: bitsToTargetHex(gbt.bits),
     gbt
@@ -259,6 +262,7 @@ function sendNotifyTo(socket: net.Socket, job: Job) {
     job.clean
   ];
   socket.write(JSON.stringify({ id: null, method: 'mining.notify', params }) + '\n');
+  // 兜底：再次下发难度，确保矿机同步
   socket.write(JSON.stringify({ id: null, method: 'mining.set_difficulty', params: [SHARE_DIFFICULTY] }) + '\n');
 }
 
@@ -367,7 +371,16 @@ async function main() {
         }
         if (method === 'mining.subscribe') {
           json(socket, id, [[['mining.set_difficulty', state.id], ['mining.notify', state.id]], state.extranonce1.toString('hex'), EXTRANONCE2_SIZE]);
+
+          // 首次连接：先下发难度，再下发任务，避免矿机用默认难度挖第一批 share
+          socket.write(JSON.stringify({
+            id: null,
+            method: 'mining.set_difficulty',
+            params: [SHARE_DIFFICULTY]
+          }) + '\n');
+
           sendNotifyTo(socket, currentJob);
+
           if (state.negotiatedVersionRolling) sendVersionMask(socket, state.versionMaskHex);
           if (state.extranonceSubscribed) sendSetExtranonce(socket, state);
           continue;
@@ -412,7 +425,7 @@ async function main() {
           }
 
           // Check target: hash header, reverse to BE, compare with BE target
-          const header = packHeader(versionHex, job.prevhashBE, rootLE, ntimeHex, job.nbits, nonceHex);
+          const header = packHeader(versionHex, job.prevhashBE, rootLE, ntimeHex, job.nbits, job.nbits ? nonceHex : nonceHex); // nonceHex used
           const headerHashBE = Buffer.from(dsha256(header)).reverse();
           const targetBE = Buffer.from(job.targetHex, 'hex');
           const meets = cmp256(headerHashBE, targetBE);
