@@ -422,7 +422,7 @@ async function main() {
           }
 
           // Check target: hash header, reverse to BE, compare with BE target
-          const header = packHeader(versionHex, job.prevhashBE, rootLE, ntimeHex, job.nbits, job.nbits ? nonceHex : nonceHex); // nonceHex used
+          const header = packHeader(versionHex, job.prevhashBE, rootLE, ntimeHex, job.nbits, nonceHex);
           const headerHashBE = Buffer.from(dsha256(header)).reverse();
           const targetBE = Buffer.from(job.targetHex, 'hex');
           const meets = cmp256(headerHashBE, targetBE);
