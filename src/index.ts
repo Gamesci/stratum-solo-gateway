@@ -17,6 +17,7 @@ type BlockType = InstanceType<typeof Block>;
 const [HOST, PORT] = (process.env.LISTEN || '0.0.0.0:3333').split(':');
 const PAYOUT_ADDRESS = process.env.PAYOUT_ADDRESS!;
 const COINBASE_TAG = (process.env.COINBASE_TAG || '/SoloGateway/').trim();
+const EXTRANONCE1_SIZE = parseInt(process.env.EXTRANONCE1_SIZE || '4', 10);
 const EXTRANONCE2_SIZE = parseInt(process.env.EXTRANONCE2_SIZE || '4', 10);
 const REFRESH_MS = parseInt(process.env.REFRESH_MS || '10000', 10);
 const VERSION_MASK_HEX = (process.env.VERSION_MASK || '0x1fffe000').toString().toLowerCase();
@@ -50,11 +51,12 @@ type Job = {
   ntime: string;
   clean: boolean;
   targetHex: string;
+  extranonce1: string; // 新增：按 job 生成的 ExtraNonce1（hex）
   gbt: Gbt;
 };
 type ClientState = {
   id: number;
-  extranonce1: Buffer;
+  extranonce1: Buffer; // 会话内缓存，订阅响应使用；实际验证以 job.extranonce1 为准
   authorized: boolean;
   extranonceSubscribed: boolean;
   negotiatedVersionRolling: boolean;
@@ -144,18 +146,29 @@ async function submitBlock(hexBlock: string) {
 
 /* ===== Job builder ===== */
 function buildJob(gbt: Gbt, clean: boolean): Job {
-  const mark = cryptoRandom(8);
+  // 每个 job 生成独立 ExtraNonce1（会在 submit 校验时使用）
+  const en1 = cryptoRandom(EXTRANONCE1_SIZE);
+
+  // 随机化 ntime (+1~+5 秒)
+  const ntimeRand = gbt.curtime + (Math.floor(Math.random() * 5) + 1);
+
+  // 为 coinbase 标记预留空间：en1 + en2（长度匹配矿机组合长度）
+  const markLen = EXTRANONCE1_SIZE + EXTRANONCE2_SIZE;
+  const mark = cryptoRandom(markLen);
+
+  // 先构造带 mark 的 coinbase 原始交易，再切分 coinb1/coinb2
   const cbMarked = buildCoinbaseRaw(mark, gbt.height, gbt.coinbasevalue);
   const idx = cbMarked.indexOf(mark);
   if (idx < 0) throw new Error('Internal error: mark not found in coinbase');
   const coinb1 = cbMarked.slice(0, idx).toString('hex');
   const coinb2 = cbMarked.slice(idx + mark.length).toString('hex');
 
+  // 计算 Merkle 分支（LE）
   const nonCbTxidsBE = gbt.transactions.map(t => t.txid || t.hash).filter((x): x is string => !!x);
   const merkleBranchesLE = merkleBranchesForCoinbaseAt0(nonCbTxidsBE);
 
   return {
-    jobId: Buffer.from(`${gbt.height}-${Date.now().toString(16)}`).toString('hex'),
+    jobId: Buffer.from(`${gbt.height}-${Date.now().toString(16)}-${cryptoRandom(2).toString('hex')}`).toString('hex'),
     coinb1,
     coinb2,
     merkleBranchesLE,
@@ -164,9 +177,10 @@ function buildJob(gbt: Gbt, clean: boolean): Job {
     prevhashLE: toLE(gbt.previousblockhash).toString('hex'),
     prevhashBE: gbt.previousblockhash,
     nbits: gbt.bits,
-    ntime: gbt.curtime.toString(16).padStart(8, '0'),
+    ntime: ntimeRand.toString(16).padStart(8, '0'),
     clean,
     targetHex: bitsToTargetHex(gbt.bits),
+    extranonce1: en1.toString('hex'),
     gbt
   };
 }
@@ -243,18 +257,21 @@ function json(socket: net.Socket, id: any, result: any, error: any = null) {
 }
 
 function sendNotifyTo(socket: net.Socket, job: Job) {
-  // 同步 job 到客户端状态，防止 jobId 不匹配
+  // 同步 job 到客户端状态
   const st = clients.get(socket);
   if (st) {
     st.jobs.set(job.jobId, job);
-
-    // 自动清理旧 job，只保留最近 3 个，防止内存增长
+    // 保留最近 3 个 job
     if (st.jobs.size > 3) {
       const firstKey = st.jobs.keys().next().value!;
       st.jobs.delete(firstKey);
     }
   }
 
+  // 先告知新的 ExtraNonce1（按 job 随机）
+  sendSetExtranonce(socket, job.extranonce1, EXTRANONCE2_SIZE);
+
+  // 再下发作业
   const params = [
     job.jobId,
     job.prevhashLE,
@@ -267,18 +284,17 @@ function sendNotifyTo(socket: net.Socket, job: Job) {
     job.clean
   ];
   socket.write(JSON.stringify({ id: null, method: 'mining.notify', params }) + '\n');
-
-  // 已移除：每次下发作业都附带 set_difficulty 的兜底发送
 }
 
 function sendVersionMask(socket: net.Socket, maskHexNo0x: string) {
   socket.write(JSON.stringify({ id: null, method: 'mining.set_version_mask', params: [maskHexNo0x] }) + '\n');
 }
-function sendSetExtranonce(socket: net.Socket, state: ClientState) {
+
+function sendSetExtranonce(socket: net.Socket, extranonce1Hex: string, ex2Size: number) {
   socket.write(JSON.stringify({
     id: null,
     method: 'mining.set_extranonce',
-    params: [state.extranonce1.toString('hex'), EXTRANONCE2_SIZE]
+    params: [extranonce1Hex, ex2Size]
   }) + '\n');
 }
 
@@ -346,7 +362,8 @@ async function main() {
     const remote = `${socket.remoteAddress}:${socket.remotePort}`;
     const state: ClientState = {
       id: Math.floor(Math.random() * 1e9),
-      extranonce1: cryptoRandom(4),
+      // 会话缓存的 en1：用于 subscribe 返回；实际校验以 job.extranonce1 为准
+      extranonce1: Buffer.from(currentJob.extranonce1, 'hex'),
       authorized: false,
       extranonceSubscribed: false,
       negotiatedVersionRolling: false,
@@ -371,13 +388,15 @@ async function main() {
         if (method === 'mining.extranonce.subscribe') {
           state.extranonceSubscribed = true;
           json(socket, id, true);
-          sendSetExtranonce(socket, state);
+          // 立即下发当前 job 的 en1
+          sendSetExtranonce(socket, currentJob.extranonce1, EXTRANONCE2_SIZE);
           continue;
         }
         if (method === 'mining.subscribe') {
+          // 订阅响应：返回当前会话的 en1（与当前 job 对齐）
           json(socket, id, [[['mining.set_difficulty', state.id], ['mining.notify', state.id]], state.extranonce1.toString('hex'), EXTRANONCE2_SIZE]);
 
-          // 首次连接：先下发难度，再下发任务，避免矿机用默认难度挖第一批 share
+          // 首次连接：先下发难度，再下发任务
           socket.write(JSON.stringify({
             id: null,
             method: 'mining.set_difficulty',
@@ -387,7 +406,8 @@ async function main() {
           sendNotifyTo(socket, currentJob);
 
           if (state.negotiatedVersionRolling) sendVersionMask(socket, state.versionMaskHex);
-          if (state.extranonceSubscribed) sendSetExtranonce(socket, state);
+          // 保守：若对端已订阅 extranonce，则再次显式发送一遍
+          if (state.extranonceSubscribed) sendSetExtranonce(socket, currentJob.extranonce1, EXTRANONCE2_SIZE);
           continue;
         }
         if (method === 'mining.authorize') {
@@ -406,8 +426,8 @@ async function main() {
             continue;
           }
 
-          // Build coinbase hex (coinb1 + en1 + en2 + coinb2)
-          const coinbaseHex = job.coinb1 + state.extranonce1.toString('hex') + en2 + job.coinb2;
+          // Coinbase: coinb1 + (job.extranonce1) + en2 + coinb2
+          const coinbaseHex = job.coinb1 + job.extranonce1 + en2 + job.coinb2;
 
           // Merkle root calculation: keep LE throughout the chain
           let rootLE = dsha256(Buffer.from(coinbaseHex, 'hex')); // coinbase txid as LE bytes
@@ -438,10 +458,10 @@ async function main() {
           if (meets) {
             console.log(`Potential block found by ${worker} | height=${job.gbt.height}`);
             try {
-              const extraNonce = Buffer.from(state.extranonce1.toString('hex') + en2, 'hex');
-              const coinbaseTX = buildCoinbaseTX_bcoin(job.gbt, extraNonce, PAYOUT_ADDRESS);
+              const extraNonce = Buffer.from(job.extranonce1 + en2, 'hex');
               const ntimeBE = parseInt(ntimeHex, 16) >>> 0;
               const nonceBE = parseInt(nonceHex, 16) >>> 0;
+              const coinbaseTX = buildCoinbaseTX_bcoin(job.gbt, extraNonce, PAYOUT_ADDRESS);
               const block = buildFullBlock_bcoin(job, coinbaseTX, versionBE, ntimeBE, nonceBE);
               const raw = block.toRaw();
               const ok = await submitBlock(raw.toString('hex'));
@@ -482,6 +502,7 @@ async function main() {
     console.log(`Payout address: ${PAYOUT_ADDRESS}`);
     console.log(`ASICBoost mask: ${VERSION_MASK_HEX}`);
     console.log(`Share difficulty: ${SHARE_DIFFICULTY}`);
+    console.log(`ExtraNonce1 size: ${EXTRANONCE1_SIZE} | ExtraNonce2 size: ${EXTRANONCE2_SIZE}`);
   });
 
   server.on('error', (err) => {
